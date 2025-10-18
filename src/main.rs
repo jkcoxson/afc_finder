@@ -537,13 +537,14 @@ fn main() {
         options.renderer = eframe::Renderer::Glow;
     }
 
-    // Set window icon on platforms that support it (not macOS).
-    // macOS uses the app bundle icon (.icns and asset catalog) instead.
+    #[cfg(target_os = "macos")]
+    {
+        options.viewport.icon = Some(std::sync::Arc::new(egui::IconData::default()));
+    }
     #[cfg(not(target_os = "macos"))]
     {
         let icon_bytes: &[u8] = include_bytes!("../icon.png");
-        let d = eframe::icon_data::from_png_bytes(icon_bytes)
-            .expect("The icon data must be valid");
+        let d = eframe::icon_data::from_png_bytes(icon_bytes).expect("The icon data must be valid");
         options.viewport.icon = Some(std::sync::Arc::new(d));
     }
 

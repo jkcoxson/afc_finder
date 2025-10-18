@@ -207,7 +207,8 @@ jobs:
             <key>CFBundleShortVersionString</key><string>${{ env.VERSION }}</string>
             <key>CFBundleExecutable</key><string>${{ env.APP_NAME }}</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-          <key>CFBundleIconFile</key><string>icon.icns</string>
+            <key>CFBundleIconFile</key><string>icon.icns</string>
+            <key>CFBundleIconName</key><string>icon</string>
           </dict></plist>
           EOF
 
