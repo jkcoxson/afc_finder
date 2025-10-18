@@ -18,8 +18,8 @@ on:
 # Global environment variables
 env:
   BINARY_NAME: afc_finder
-  APP_NAME: AFCFinder
   VERSION: ${{ github.event.inputs.version || '1.0.0' }}
+  APP_NAME: afc_finder
   ICON_PNG: icon.png
   CARGO_TERM_COLOR: always
 
@@ -41,15 +41,14 @@ jobs:
             toolfile: appimagetool-aarch64.AppImage
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       # Build setup
       - name: Setup Rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           components: rustfmt, clippy
-          target: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
 
       - name: Install system dependencies
         run: |
@@ -63,6 +62,16 @@ jobs:
             appstream \
             usbmuxd
 
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{matrix.target}}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
       # Build and package
       - name: Build binary
         run: cargo build --release --bin ${{ env.BINARY_NAME }} --target ${{ matrix.target }}
@@ -75,10 +84,8 @@ jobs:
 
       - name: Prepare AppDir
         run: |
-          mkdir -p AppDir/usr/bin AppDir/usr/lib AppDir/usr/share/icons/hicolor/256x256/apps AppDir/etc/udev/rules.d
+          mkdir -p AppDir/usr/bin AppDir/usr/lib AppDir/usr/share/icons/hicolor/256x256/apps
           cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} AppDir/usr/bin/
-          cp $(which usbmuxd) AppDir/usr/bin/
-          sudo cp /lib/udev/rules.d/39-usbmuxd.rules AppDir/etc/udev/rules.d/
           ICON_NAME=${ICON_PNG##*/}; BASENAME=${ICON_NAME%.*}
           cp ${{ env.ICON_PNG }} AppDir/${BASENAME}.png
           cp ${{ env.ICON_PNG }} AppDir/usr/share/icons/hicolor/256x256/apps/${BASENAME}.png
@@ -117,14 +124,23 @@ jobs:
             target: aarch64-apple-darwin
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Set up Rust for ${{ matrix.arch }}
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           components: rustfmt, clippy
-          target: ${{ matrix.target }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{matrix.target}}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
 
       - name: Build ${{ matrix.arch }} slice
         run: |
@@ -138,13 +154,16 @@ jobs:
           name: slice-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
 
-  package-macos:
-    name: Package macOS Universal DMG
+  macos-bundle:
+    name: Create, Sign, Notarize & Upload Universal DMG
     needs: macos-universal
     runs-on: macos-latest
+    env:
+      HAVE_SIGNING_SECRETS: ${{ secrets.DEV_ID_P12_BASE64 != '' && secrets.DEV_ID_P12_PASSWORD != '' && secrets.DEV_IDENTITY_NAME != '' }}
+      HAVE_NOTARIZE_SECRETS: ${{ secrets.NOTARIZE_APPLE_ID != '' && secrets.NOTARIZE_APP_SPECIFIC_PASS != '' && secrets.NOTARIZE_TEAM_ID != '' }}
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Download x86_64 slice
         uses: actions/download-artifact@v4
@@ -157,6 +176,13 @@ jobs:
         with:
           name: slice-arm64
           path: slice-arm64
+
+      - name: Import Developer ID Certificate
+        if: env.HAVE_SIGNING_SECRETS == 'true'
+        uses: apple-actions/import-codesign-certs@v5
+        with:
+          p12-file-base64: ${{ secrets.DEV_ID_P12_BASE64 }}
+          p12-password: ${{ secrets.DEV_ID_P12_PASSWORD }}
 
       - name: Build & Assemble Universal .app
         run: |
@@ -176,33 +202,29 @@ jobs:
           <plist version="1.0"><dict>
             <key>CFBundleName</key><string>${{ env.APP_NAME }}</string>
             <key>CFBundleDisplayName</key><string>${{ env.APP_NAME }}</string>
-            <key>CFBundleIdentifier</key><string>com.unsigned.${{ env.APP_NAME }}</string>
+            <key>CFBundleIdentifier</key><string>com.jkcoxson.AFC_finder.${{ env.APP_NAME }}</string>
             <key>CFBundleVersion</key><string>${{ env.VERSION }}</string>
             <key>CFBundleShortVersionString</key><string>${{ env.VERSION }}</string>
             <key>CFBundleExecutable</key><string>${{ env.APP_NAME }}</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleIconFile</key><string>icon.icns</string>
+            <key>CFBundleIconName</key><string>icon</string>
           </dict></plist>
           EOF
 
-          # 3) Generate .icns from PNG
-          ICONSET_DIR="icons.iconset"
-          mkdir -p "$ICONSET_DIR"
-          sips -z 16 16     "${{ env.ICON_PNG }}" --out "$ICONSET_DIR/icon_16x16.png"
-          sips -z 32 32     "${{ env.ICON_PNG }}" --out "$ICONSET_DIR/icon_16x16@2x.png"
-          sips -z 32 32     "${{ env.ICON_PNG }}" --out "$ICONSET_DIR/icon_32x32.png"
-          sips -z 64 64     "${{ env.ICON_PNG }}" --out "$ICONSET_DIR/icon_32x32@2x.png"
-          sips -z 128 128   "${{ env.ICON_PNG }}" --out "$ICONSET_DIR/icon_128x128.png"
-          sips -z 256 256   "${{ env.ICON_PNG }}" --out "$ICONSET_DIR/icon_128x128@2x.png"
-          sips -z 256 256   "${{ env.ICON_PNG }}" --out "$ICONSET_DIR/icon_256x256.png"
-          sips -z 512 512   "${{ env.ICON_PNG }}" --out "$ICONSET_DIR/icon_256x256@2x.png"
-          sips -z 512 512   "${{ env.ICON_PNG }}" --out "$ICONSET_DIR/icon_512x512.png"
-          sips -z 1024 1024  "${{ env.ICON_PNG }}" --out "$ICONSET_DIR/icon_512x512@2x.png"
-          iconutil -c icns "$ICONSET_DIR" -o "$APP/Contents/Resources/icon.icns"
-          rm -rf "$ICONSET_DIR"
+          # 3) Copy icon files to Resources
+          cp icon.icns "$APP/Contents/Resources/"
+          cp Assets.car "$APP/Contents/Resources/"
 
           # 4) Clean any stray xattrs
           xattr -rc "$APP"
+
+      - name: Code-sign with Hardened Runtime & Timestamp
+        if: env.HAVE_SIGNING_SECRETS == 'true'
+        run: |
+          APP="${{ env.APP_NAME }}.app"
+          codesign --force --deep --options runtime --timestamp \
+            --sign "${{ secrets.DEV_IDENTITY_NAME }}" "$APP"
 
       - name: Fix Permissions
         run: |
@@ -225,7 +247,18 @@ jobs:
           rm -rf dmg-staging
           echo "$DMG" > dmg-path.txt
 
-      - name: Upload Universal DMG
+      - name: Notarize & Staple DMG
+        if: env.HAVE_NOTARIZE_SECRETS == 'true'
+        run: |
+          DMG=$(cat dmg-path.txt)
+          xcrun notarytool submit "$DMG" \
+            --apple-id "${{ secrets.NOTARIZE_APPLE_ID }}" \
+            --password "${{ secrets.NOTARIZE_APP_SPECIFIC_PASS }}" \
+            --team-id "${{ secrets.NOTARIZE_TEAM_ID }}" \
+            --wait --verbose
+          xcrun stapler staple "$DMG"
+
+      - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.APP_NAME }}-${{ env.VERSION }}-macos-universal.dmg
@@ -238,11 +271,19 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           components: rustfmt, clippy
-          target: x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
       - name: Build and Rename Executable
         shell: bash
         run: |
