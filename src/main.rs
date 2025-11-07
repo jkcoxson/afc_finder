@@ -257,6 +257,7 @@ fn main() {
 
                             // Use write_with_callback
                             file.write_with_callback(&data, callback, path_clone).await?;
+                            file.close().await?;
 
                             Ok::<(), Box<dyn std::error::Error>>(())
                         }
