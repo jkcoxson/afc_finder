@@ -9,7 +9,10 @@ use std::{
 
 use egui::{Color32, ComboBox, TextEdit};
 use log::error;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+};
 
 use idevice::{
     IdeviceError, IdeviceService,
@@ -190,29 +193,32 @@ fn main() {
                 AfcCommands::DownloadFile(remote_path, local_path) => {
                     if let Some(client) = &mut afc_client {
                         let status = async {
+                            let file_info = client.get_file_info(&remote_path).await?;
                             let mut file = client.open(&remote_path, AfcFopenMode::RdOnly).await?;
 
                             // Clone sender and remote path for the callback
                             let sender = gui_sender_afc.clone();
-                            let path_clone = remote_path.clone();
-
-                            // Define the async callback (using bytes read / total bytes)
-                            let callback = |((bytes_read, total), path): ((usize, usize), String)| {
-                                let sender_clone = sender.clone();
-                                async move {
-                                    // Send progress update
-                                    let _ = sender_clone.send(GuiCommands::Afc(
-                                        GuiAfcCommands::DownloadProgress(path, bytes_read, total),
-                                    ));
-                                }
-                            };
 
                             // Use hypothetical read_with_callback
                             // Pass total_size obtained earlier
-                            let data = file.read_with_callback( callback, path_clone).await?;
+                            let mut res = Vec::new();
+                            let mut s = 0;
+                            loop {
+                                let mut buf: [u8; 1024] = [0; 1024];
+                                s += file.read(&mut buf).await?;
+                                res.extend(buf);
+
+                                let _ = sender.send(GuiCommands::Afc(
+                                    GuiAfcCommands::DownloadProgress(remote_path.clone(), s, file_info.size),
+                                ));
+
+                                if s == file_info.size {
+                                    break;
+                                }
+                            }
 
                             // Write data to local file
-                            tokio::fs::write(&local_path, data).await?;
+                            tokio::fs::write(&local_path, res).await?;
 
                             Ok::<(), Box<dyn std::error::Error>>(())
                         }
@@ -240,23 +246,19 @@ fn main() {
                             let data = tokio::fs::read(&local_path).await?;
                             let mut file = client.open(&remote_path, AfcFopenMode::Wr).await?;
 
-                            // Clone sender and remote path for the callback
                             let sender = gui_sender_afc.clone();
-                            let path_clone = remote_path.clone();
+                            let chunks = data.chunks(1024);
+                            let total_chunks = chunks.len();
+                            for (i, chunk) in chunks.enumerate() {
+                                let _ = file.write(chunk).await?;
 
-                            // Define the async callback
-                            let callback = |((current, total), path): ((usize, usize), String)| {
-                                let sender_clone = sender.clone();
-                                async move {
-                                    // Send progress update (ignore potential send error)
-                                    let _ = sender_clone.send(GuiCommands::Afc(
-                                        GuiAfcCommands::UploadProgress(path, current + 1, total),
-                                    ));
-                                }
-                            };
+                                let _ = sender.send(GuiCommands::Afc(
+                                    GuiAfcCommands::UploadProgress(remote_path.clone(), i, total_chunks),
+                                ));
+
+                            }
 
                             // Use write_with_callback
-                            file.write_with_callback(&data, callback, path_clone).await?;
                             file.close().await?;
 
                             Ok::<(), Box<dyn std::error::Error>>(())
