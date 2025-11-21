@@ -206,15 +206,11 @@ fn main() {
                                     .open(&local_path)
                                     .await?
                             );
+                            let sender = gui_sender_afc.clone();
 
                             // 64KB buffer
                             let mut buf = [0u8; 64 * 1024];
-
-                            let sender = gui_sender_afc.clone();
-
                             let mut transferred: usize = 0;
-                            let mut last_event: usize = 0;
-                            let event_threshold = 256 * 1024; // update progress every 256KB
 
                             loop {
                                 let n = remote_file.read(&mut buf).await?;
@@ -226,12 +222,9 @@ fn main() {
                                 local_file.write_all(&buf[..n]).await?;
                                 transferred += n;
 
-                                if transferred - last_event >= event_threshold {
-                                    let _ = sender.send(GuiCommands::Afc(
-                                        GuiAfcCommands::DownloadProgress(remote_path.clone(), transferred, file_info.size),
-                                    ));
-                                    last_event = transferred;
-                                }
+                                let _ = sender.send(GuiCommands::Afc(
+                                    GuiAfcCommands::DownloadProgress(remote_path.clone(), transferred, file_info.size),
+                                ));
                             }
 
                             local_file.flush().await?;
@@ -270,10 +263,7 @@ fn main() {
 
                             // 64KB buffer
                             let mut buf = [0u8; 64 * 1024];
-
                             let mut transferred: usize = 0;
-                            let mut last_event: usize = 0;
-                            let event_threshold = 256 * 1024; // update progress every 256KB
 
                             loop {
                                 let n = local_file.read(&mut buf).await?;
@@ -285,12 +275,9 @@ fn main() {
                                 remote_file.write_all(&buf[..n]).await?;
                                 transferred += n;
 
-                                if transferred - last_event >= event_threshold {
-                                    let _ = sender.send(GuiCommands::Afc(
-                                        GuiAfcCommands::UploadProgress(remote_path.clone(), transferred, local_file_size),
-                                    ));
-                                    last_event = transferred;
-                                }
+                                let _ = sender.send(GuiCommands::Afc(
+                                    GuiAfcCommands::UploadProgress(remote_path.clone(), transferred, local_file_size),
+                                ));
                             }
 
                             local_file.flush().await?;
