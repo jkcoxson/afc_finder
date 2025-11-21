@@ -194,31 +194,48 @@ fn main() {
                     if let Some(client) = &mut afc_client {
                         let status = async {
                             let file_info = client.get_file_info(&remote_path).await?;
-                            let mut file = client.open(&remote_path, AfcFopenMode::RdOnly).await?;
+                            let mut remote_file = tokio::io::BufReader::new(
+                                client.open(&remote_path, AfcFopenMode::RdOnly).await?
+                            );
 
-                            // Clone sender and remote path for the callback
+                            let mut local_file = tokio::io::BufWriter::new(
+                                tokio::fs::OpenOptions::new()
+                                    .write(true)
+                                    .create(true)
+                                    .truncate(true)
+                                    .open(&local_path)
+                                    .await?
+                            );
+
+                            // 64KB buffer
+                            let mut buf = [0u8; 64 * 1024];
+
                             let sender = gui_sender_afc.clone();
 
-                            // Use hypothetical read_with_callback
-                            // Pass total_size obtained earlier
-                            let mut res = Vec::new();
-                            let mut s = 0;
+                            let mut transferred: usize = 0;
+                            let mut last_event: usize = 0;
+                            let event_threshold = 256 * 1024; // update progress every 256KB
+
                             loop {
-                                let mut buf: [u8; 1024] = [0; 1024];
-                                s += file.read(&mut buf).await?;
-                                res.extend(buf);
+                                let n = remote_file.read(&mut buf).await?;
 
-                                let _ = sender.send(GuiCommands::Afc(
-                                    GuiAfcCommands::DownloadProgress(remote_path.clone(), s, file_info.size),
-                                ));
-
-                                if s == file_info.size {
+                                if n == 0 {
                                     break;
+                                }
+
+                                local_file.write_all(&buf[..n]).await?;
+                                transferred += n;
+
+                                if transferred - last_event >= event_threshold {
+                                    let _ = sender.send(GuiCommands::Afc(
+                                        GuiAfcCommands::DownloadProgress(remote_path.clone(), transferred, file_info.size),
+                                    ));
+                                    last_event = transferred;
                                 }
                             }
 
-                            // Write data to local file
-                            tokio::fs::write(&local_path, res).await?;
+                            local_file.flush().await?;
+                            remote_file.into_inner().close().await?;
 
                             Ok::<(), Box<dyn std::error::Error>>(())
                         }
@@ -243,23 +260,41 @@ fn main() {
                 AfcCommands::UploadFile(local_path, remote_path) => {
                     if let Some(client) = &mut afc_client {
                         let status = async {
-                            let data = tokio::fs::read(&local_path).await?;
-                            let mut file = client.open(&remote_path, AfcFopenMode::Wr).await?;
+                            let local_file = tokio::fs::OpenOptions::new().read(true).open(&local_path).await?;
+                            let local_file_size = local_file.metadata().await?.len() as usize;
+
+                            let mut local_file = tokio::io::BufReader::new(local_file) ;
+                            let mut remote_file = tokio::io::BufWriter::new(client.open(&remote_path, AfcFopenMode::Wr).await?);
 
                             let sender = gui_sender_afc.clone();
-                            let chunks = data.chunks(1024);
-                            let total_chunks = chunks.len();
-                            for (i, chunk) in chunks.enumerate() {
-                                let _ = file.write(chunk).await?;
 
-                                let _ = sender.send(GuiCommands::Afc(
-                                    GuiAfcCommands::UploadProgress(remote_path.clone(), i, total_chunks),
-                                ));
+                            // 64KB buffer
+                            let mut buf = [0u8; 64 * 1024];
 
+                            let mut transferred: usize = 0;
+                            let mut last_event: usize = 0;
+                            let event_threshold = 256 * 1024; // update progress every 256KB
+
+                            loop {
+                                let n = local_file.read(&mut buf).await?;
+
+                                if n == 0 {
+                                    break;
+                                }
+
+                                remote_file.write_all(&buf[..n]).await?;
+                                transferred += n;
+
+                                if transferred - last_event >= event_threshold {
+                                    let _ = sender.send(GuiCommands::Afc(
+                                        GuiAfcCommands::UploadProgress(remote_path.clone(), transferred, local_file_size),
+                                    ));
+                                    last_event = transferred;
+                                }
                             }
 
-                            // Use write_with_callback
-                            file.close().await?;
+                            local_file.flush().await?;
+                            remote_file.into_inner().close().await?;
 
                             Ok::<(), Box<dyn std::error::Error>>(())
                         }
