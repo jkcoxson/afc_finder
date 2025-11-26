@@ -280,7 +280,7 @@ fn main() {
                                 ));
                             }
 
-                            local_file.flush().await?;
+                            remote_file.flush().await?;
                             remote_file.into_inner().close().await?;
 
                             Ok::<(), Box<dyn std::error::Error>>(())
