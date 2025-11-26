@@ -163,8 +163,7 @@ fn main() {
                                         continue;
                                     }
                                     // We need the full path to get info
-                                    let full_path =
-                                        Path::new(&path).join(&item).to_string_lossy().to_string();
+                                    let full_path = format!("{path}/{item}");
 
                                     match client.get_file_info(&full_path).await {
                                         Ok(info) => {
@@ -349,10 +348,7 @@ fn main() {
                                             continue;
                                         }
                                         item_count += 1;
-                                        let child_remote_path = Path::new(&remote_dir_path)
-                                            .join(&item_name)
-                                            .to_string_lossy()
-                                            .to_string();
+                                        let child_remote_path = format!("{remote_dir_path}/{item_name}");
                                         let child_local_path = local_dir_path.join(&item_name);
 
                                         // 3. Get info for each item
@@ -431,10 +427,8 @@ fn main() {
                                             item_count += 1;
                                             let entry_path = entry.path();
                                             let entry_name = entry.file_name();
-                                            let child_remote_path = Path::new(&remote_dir_path)
-                                                .join(&entry_name)
-                                                .to_string_lossy()
-                                                .to_string();
+                                            let entry_name = entry_name.to_str().expect("non utf8");
+                                            let child_remote_path = format!("{remote_dir_path}/{entry_name}");
 
                                             // 3. Check if entry is file or directory
                                             match entry.file_type().await {
@@ -1013,10 +1007,10 @@ impl MyApp {
                     ui.text_edit_singleline(&mut self.afc_state.new_folder_name);
                     ui.horizontal(|ui| {
                         if ui.button("Create").clicked() {
-                            let new_path = Path::new(&self.afc_state.current_path)
-                                .join(&self.afc_state.new_folder_name)
-                                .to_string_lossy()
-                                .to_string();
+                            let new_path = format!(
+                                "{}/{}",
+                                &self.afc_state.current_path, self.afc_state.new_folder_name
+                            );
                             self.afc_sender
                                 .send(AfcCommands::CreateDirectory(new_path))
                                 .unwrap();
@@ -1105,10 +1099,11 @@ impl MyApp {
                 if ui.button("Upload File...").clicked()
                     && let Some(path) = FileDialog::new().pick_file()
                 {
-                    let remote_path = Path::new(&self.afc_state.current_path)
-                        .join(path.file_name().unwrap())
-                        .to_string_lossy()
-                        .to_string();
+                    let remote_path = format!(
+                        "{}/{}",
+                        self.afc_state.current_path,
+                        path.file_name().unwrap().to_str().expect("non utf8")
+                    );
                     self.afc_sender
                         .send(AfcCommands::UploadFile(path, remote_path))
                         .unwrap();
@@ -1120,10 +1115,11 @@ impl MyApp {
                         .pick_folder()
                 {
                     if let Some(folder_name) = local_folder_path.file_name() {
-                        let remote_target_dir = Path::new(&self.afc_state.current_path)
-                            .join(folder_name) // Target directory will have the same name
-                            .to_string_lossy()
-                            .to_string();
+                        let remote_target_dir = format!(
+                            "{}/{}",
+                            self.afc_state.current_path,
+                            folder_name.to_str().expect("non utf8")
+                        );
 
                         self.afc_state.status_message = format!(
                             "Starting upload of folder {}...",
@@ -1166,10 +1162,8 @@ impl MyApp {
 
                         if let Some(item) = selected_item_info {
                             let is_dir = item.info.st_ifmt == "S_IFDIR";
-                            let remote_path = Path::new(&self.afc_state.current_path)
-                                .join(selected_name)
-                                .to_string_lossy()
-                                .to_string();
+                            let remote_path =
+                                format!("{}/{}", self.afc_state.current_path, selected_name);
 
                             if is_dir {
                                 // Prompt for local save *directory*
@@ -1230,10 +1224,7 @@ impl MyApp {
                 .clicked()
                 .then(|| {
                     if let Some(selected) = &self.afc_state.selected_item {
-                        let path_to_delete = Path::new(&self.afc_state.current_path)
-                            .join(selected)
-                            .to_string_lossy()
-                            .to_string();
+                        let path_to_delete = format!("{}/{selected}", self.afc_state.current_path);
                         self.afc_sender
                             .send(AfcCommands::DeletePath(path_to_delete))
                             .unwrap();
@@ -1333,11 +1324,14 @@ impl MyApp {
                                     if response.double_clicked() && is_dir {
                                         self.afc_state.status_message =
                                             "Loading directory...".to_string();
-                                        self.afc_state.current_path =
-                                            Path::new(&self.afc_state.current_path)
-                                                .join(item_name)
-                                                .to_string_lossy()
-                                                .to_string();
+                                        self.afc_state.current_path = format!(
+                                            "{}/{item_name}",
+                                            if self.afc_state.current_path == "/" {
+                                                ""
+                                            } else {
+                                                self.afc_state.current_path.as_str()
+                                            }
+                                        );
                                         self.afc_sender
                                             .send(AfcCommands::ListDirectory(
                                                 self.afc_state.current_path.clone(),
