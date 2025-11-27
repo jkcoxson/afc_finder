@@ -1995,9 +1995,9 @@ dependencies = [
 
 [[package]]
 name = "idevice"
-version = "0.1.49"
+version = "0.1.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b4818573194fb74be6ba41ad12f363b61fc7632e5078ec4466ca309d11f9c8a"
+checksum = "effc7c8fe1bfa5051717c4dc20c3bcc4828b13009a6c95ff6fc8c3f8ccdf4d43"
 dependencies = [
  "async_zip",
  "base64",
@@ -3244,9 +3244,9 @@ dependencies = [
 
 [[package]]
 name = "rfd"
-version = "0.15.4"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef2bee61e6cffa4635c72d7d81a84294e28f0930db0ddcb0f66d10244674ebed"
+checksum = "a15ad77d9e70a92437d8f74c35d99b4e4691128df018833e99f90bcd36152672"
 dependencies = [
  "block2 0.6.2",
  "dispatch2",
@@ -3263,7 +3263,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
