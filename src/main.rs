@@ -2,16 +2,24 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
+
+use futures_util::future::join_all;
 
 use egui::{Color32, ComboBox, TextEdit};
 use log::error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    sync::{
+        Notify,
+        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    },
 };
 
 use idevice::{
@@ -21,6 +29,7 @@ use idevice::{
     house_arrest::HouseArrestClient,
     installation_proxy::InstallationProxyClient,
     lockdown::LockdownClient,
+    provider::UsbmuxdProvider,
     usbmuxd::{UsbmuxdAddr, UsbmuxdConnection, UsbmuxdDevice},
 };
 use rfd::FileDialog;
@@ -35,7 +44,6 @@ fn main() {
     // Start with an initial device scan
     idevice_sender.send(IdeviceCommands::GetDevices).unwrap();
 
-    let self_afc_sender = afc_sender.clone();
     let app = MyApp {
         devices: None,
         devices_placeholder: "Loading...".to_string(),
@@ -108,36 +116,21 @@ fn main() {
     let gui_sender_afc = gui_sender.clone();
     rt.spawn(async move {
         let mut afc_client: Option<AfcClient> = None;
+        // How we connected, so folder transfers can open extra connections
+        let mut connection: Option<(Arc<UsbmuxdProvider>, AfcMode)> = None;
+        let mut transfers: Vec<tokio::task::AbortHandle> = Vec::new();
 
         while let Some(command) = afc_receiver.recv().await {
             match command {
                 AfcCommands::Connect(dev, afc_mode) => {
+                    for t in transfers.drain(..) {
+                        t.abort();
+                    }
                     let provider = Arc::new(dev.to_provider(UsbmuxdAddr::default(), "afc_gui"));
-                    let client_result = match afc_mode {
-                        AfcMode::Root => AfcClient::connect(&*provider).await,
-                        AfcMode::Documents(bundle_id) => {
-                            match HouseArrestClient::connect(&*provider).await {
-                                Ok(h) => h.vend_documents(&bundle_id).await,
-                                Err(e) => Err(e),
-                            }
-                        }
-                        AfcMode::Container(bundle_id) => {
-                            match HouseArrestClient::connect(&*provider).await {
-                                Ok(h) => h.vend_container(&bundle_id).await,
-                                Err(e) => Err(e),
-                            }
-                        }
-                        AfcMode::CrashReports => {
-                            match CrashReportCopyMobileClient::connect(&*provider).await {
-                                Ok(c) => Ok(c.to_afc_client()),
-                                Err(e) => Err(e),
-                            }
-                        }
-                    };
-
-                    match client_result {
+                    match connect_afc(&provider, &afc_mode).await {
                         Ok(client) => {
                             afc_client = Some(client);
+                            connection = Some((provider, afc_mode));
                             gui_sender_afc
                                 .send(GuiCommands::Afc(GuiAfcCommands::ConnectionStatus(Ok(()))))
                                 .unwrap();
@@ -191,52 +184,29 @@ fn main() {
                 }
                 AfcCommands::DownloadFile(remote_path, local_path) => {
                     if let Some(client) = &mut afc_client {
+                        let sender = gui_sender_afc.clone();
                         let status = async {
                             let file_info = client.get_file_info(&remote_path).await?;
-                            let mut remote_file = tokio::io::BufReader::new(
-                                client.open(&remote_path, AfcFopenMode::RdOnly).await?
-                            );
-
-                            let mut local_file = tokio::io::BufWriter::new(
-                                tokio::fs::OpenOptions::new()
-                                    .write(true)
-                                    .create(true)
-                                    .truncate(true)
-                                    .open(&local_path)
-                                    .await?
-                            );
-                            let sender = gui_sender_afc.clone();
-
-                            // 64KB buffer
-                            let mut buf = [0u8; 64 * 1024];
-                            let mut transferred: usize = 0;
-
-                            loop {
-                                let n = remote_file.read(&mut buf).await?;
-
-                                if n == 0 {
-                                    break;
-                                }
-
-                                local_file.write_all(&buf[..n]).await?;
-                                transferred += n;
-
+                            download_file(client, &remote_path, &local_path, |transferred| {
                                 let _ = sender.send(GuiCommands::Afc(
-                                    GuiAfcCommands::DownloadProgress(remote_path.clone(), transferred, file_info.size),
+                                    GuiAfcCommands::DownloadProgress(
+                                        remote_path.clone(),
+                                        transferred,
+                                        file_info.size,
+                                    ),
                                 ));
-                            }
-
-                            local_file.flush().await?;
-                            remote_file.into_inner().close().await?;
-
-                            Ok::<(), Box<dyn std::error::Error>>(())
+                            })
+                            .await
                         }
                         .await;
 
                         let msg = match status {
                             Ok(_) => Ok(format!(
                                 "Downloaded {} to {}",
-                                Path::new(&remote_path).file_name().unwrap_or_default().to_string_lossy(),
+                                Path::new(&remote_path)
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy(),
                                 local_path.display()
                             )),
                             Err(e) => Err(e.to_string()),
@@ -251,38 +221,19 @@ fn main() {
                 }
                 AfcCommands::UploadFile(local_path, remote_path) => {
                     if let Some(client) = &mut afc_client {
+                        let sender = gui_sender_afc.clone();
                         let status = async {
-                            let local_file = tokio::fs::OpenOptions::new().read(true).open(&local_path).await?;
-                            let local_file_size = local_file.metadata().await?.len() as usize;
-
-                            let mut local_file = tokio::io::BufReader::new(local_file) ;
-                            let mut remote_file = tokio::io::BufWriter::new(client.open(&remote_path, AfcFopenMode::Wr).await?);
-
-                            let sender = gui_sender_afc.clone();
-
-                            // 64KB buffer
-                            let mut buf = [0u8; 64 * 1024];
-                            let mut transferred: usize = 0;
-
-                            loop {
-                                let n = local_file.read(&mut buf).await?;
-
-                                if n == 0 {
-                                    break;
-                                }
-
-                                remote_file.write_all(&buf[..n]).await?;
-                                transferred += n;
-
-                                let _ = sender.send(GuiCommands::Afc(
-                                    GuiAfcCommands::UploadProgress(remote_path.clone(), transferred, local_file_size),
-                                ));
-                            }
-
-                            remote_file.flush().await?;
-                            remote_file.into_inner().close().await?;
-
-                            Ok::<(), Box<dyn std::error::Error>>(())
+                            let local_file_size =
+                                tokio::fs::metadata(&local_path).await?.len() as usize;
+                            upload_file(client, &local_path, &remote_path, |transferred| {
+                                let _ =
+                                    sender.send(GuiCommands::Afc(GuiAfcCommands::UploadProgress(
+                                        remote_path.clone(),
+                                        transferred,
+                                        local_file_size,
+                                    )));
+                            })
+                            .await
                         }
                         .await;
 
@@ -325,170 +276,65 @@ fn main() {
                     }
                 }
                 AfcCommands::Disconnect => {
+                    for t in transfers.drain(..) {
+                        t.abort();
+                    }
                     afc_client = None;
+                    connection = None;
                 }
 
                 AfcCommands::DownloadDirectory(remote_dir_path, local_dir_path) => {
-                    if let Some(client) = &mut afc_client {
-                        let status_msg: Result<String, String>; // To report final status
-
-                        // 1. Create the local directory
-                        if let Err(e) = tokio::fs::create_dir_all(&local_dir_path).await {
-                            status_msg = Err(format!(
-                                "Failed to create local directory {}: {}",
-                                local_dir_path.display(), e
-                            ));
-                        } else {
-                            // 2. List remote directory contents
-                            match client.list_dir(&remote_dir_path).await {
-                                Ok(items) => {
-                                    let mut item_count = 0;
-                                    for item_name in items {
-                                        if item_name == "." || item_name == ".." {
-                                            continue;
-                                        }
-                                        item_count += 1;
-                                        let child_remote_path = format!("{remote_dir_path}/{item_name}");
-                                        let child_local_path = local_dir_path.join(&item_name);
-
-                                        // 3. Get info for each item
-                                        match client.get_file_info(&child_remote_path).await {
-                                            Ok(info) => {
-                                                // 4. Send command to self for recursive processing
-                                                if info.st_ifmt == "S_IFDIR" {
-                                                    // It's a directory, send DownloadDirectory
-                                                    if let Err(e) = self_afc_sender.send(
-                                                        AfcCommands::DownloadDirectory(
-                                                            child_remote_path,
-                                                            child_local_path,
-                                                        ),
-                                                    ) {
-                                                        error!("Failed to queue sub-directory download: {}", e);
-                                                        // How to handle this? Maybe stop recursion?
-                                                    }
-                                                } else {
-                                                    // It's a file, send DownloadFile
-                                                     if let Err(e) = self_afc_sender.send(
-                                                        AfcCommands::DownloadFile(
-                                                            child_remote_path,
-                                                            child_local_path,
-                                                        ),
-                                                    ) {
-                                                        error!("Failed to queue file download: {}", e);
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error!(
-                                                    "Failed to get info for {}: {:?}. Skipping.",
-                                                    child_remote_path, e
-                                                );
-                                            }
-                                        }
-                                    }
-                                    // Report success for *this level*
-                                    status_msg = Ok(format!(
-                                        "Queued {} items from {}",
-                                        item_count, remote_dir_path
-                                    ));
-                                }
-                                Err(e) => {
-                                    status_msg = Err(format!(
-                                        "Failed to list directory {}: {}",
-                                        remote_dir_path, e
-                                    ));
-                                }
-                            }
-                        }
-
-                        // Send status update for this specific directory operation
-                        gui_sender_afc
-                            .send(GuiCommands::Afc(GuiAfcCommands::OperationStatus(status_msg)))
-                            .unwrap(); // Or handle error
+                    if let Some((provider, afc_mode)) = &connection {
+                        let label = format!(
+                            "Downloading {}",
+                            Path::new(&remote_dir_path)
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                        );
+                        let job = TransferJob::Download(remote_dir_path, local_dir_path);
+                        transfers.retain(|t| !t.is_finished());
+                        transfers.push(
+                            tokio::spawn(run_folder_transfer(
+                                provider.clone(),
+                                afc_mode.clone(),
+                                job,
+                                label,
+                                false,
+                                gui_sender_afc.clone(),
+                            ))
+                            .abort_handle(),
+                        );
                     } else {
-                         // Should not happen if DownloadDirectory is only sent when connected
-                         error!("Received DownloadDirectory command while not connected.");
+                        // Should not happen if DownloadDirectory is only sent when connected
+                        error!("Received DownloadDirectory command while not connected.");
                     }
                 }
 
                 AfcCommands::UploadDirectory(local_dir_path, remote_dir_path) => {
-                    if let Some(client) = &mut afc_client {
-                        let status_msg: Result<String, String>;
-
-                        // 1. Create the remote directory
-                        match client.mk_dir(&remote_dir_path).await {
-                             Ok(_) => {
-                                // 2. Read the local directory contents
-                                match tokio::fs::read_dir(&local_dir_path).await {
-                                    Ok(mut dir_entries) => {
-                                        let mut item_count = 0;
-                                        // Use loop and poll_next_entry for async iteration
-                                        while let Ok(Some(entry)) = dir_entries.next_entry().await {
-                                            item_count += 1;
-                                            let entry_path = entry.path();
-                                            let entry_name = entry.file_name();
-                                            let entry_name = entry_name.to_str().expect("non utf8");
-                                            let child_remote_path = format!("{remote_dir_path}/{entry_name}");
-
-                                            // 3. Check if entry is file or directory
-                                            match entry.file_type().await {
-                                                Ok(file_type) => {
-                                                    // 4. Queue up recursive command
-                                                    if file_type.is_dir() {
-                                                        if let Err(e) = self_afc_sender.send(
-                                                            AfcCommands::UploadDirectory(
-                                                                entry_path, // local subdir path
-                                                                child_remote_path, // remote subdir path
-                                                            ),
-                                                        ) {
-                                                             error!("Failed to queue sub-directory upload: {}", e);
-                                                        }
-                                                    } else if file_type.is_file() {
-                                                         if let Err(e) = self_afc_sender.send(
-                                                            AfcCommands::UploadFile(
-                                                                entry_path, // local file path
-                                                                child_remote_path, // remote file path
-                                                            ),
-                                                        ) {
-                                                             error!("Failed to queue file upload: {}", e);
-                                                        }
-                                                    } else {
-                                                         // Skip symlinks, sockets, etc.
-                                                         log::warn!("Skipping unsupported file type at {:?}", entry_path);
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                     error!("Failed to get file type for {:?}: {}. Skipping.", entry_path, e);
-                                                }
-                                            }
-                                        }
-                                        status_msg = Ok(format!(
-                                            "Queued {} items from {}",
-                                            item_count, local_dir_path.display()
-                                        ));
-                                    }
-                                    Err(e) => {
-                                         status_msg = Err(format!(
-                                            "Failed to read local directory {}: {}",
-                                            local_dir_path.display(), e
-                                        ));
-                                    }
-                                }
-                             }
-                             Err(e) => {
-                                // Handle cases where mkdir fails (e.g., directory exists, permissions)
-                                // If it already exists, maybe proceed? Or report error?
-                                // Let's report the error for now.
-                                status_msg = Err(format!("Failed to create remote directory {}: {}", remote_dir_path, e));
-                             }
-                        }
-
-                         // Send status update
-                         gui_sender_afc
-                            .send(GuiCommands::Afc(GuiAfcCommands::OperationStatus(status_msg)))
-                            .unwrap(); // Or handle error
+                    if let Some((provider, afc_mode)) = &connection {
+                        let label = format!(
+                            "Uploading {}",
+                            local_dir_path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                        );
+                        let job = TransferJob::UploadDir(local_dir_path, remote_dir_path);
+                        transfers.retain(|t| !t.is_finished());
+                        transfers.push(
+                            tokio::spawn(run_folder_transfer(
+                                provider.clone(),
+                                afc_mode.clone(),
+                                job,
+                                label,
+                                true,
+                                gui_sender_afc.clone(),
+                            ))
+                            .abort_handle(),
+                        );
                     } else {
-                         error!("Received UploadDirectory command while not connected.");
+                        error!("Received UploadDirectory command while not connected.");
                     }
                 }
             }
@@ -584,6 +430,303 @@ fn main() {
     .unwrap();
 }
 
+const TRANSFER_CONNECTIONS: usize = 32;
+
+type TransferError = Box<dyn std::error::Error + Send + Sync>;
+
+async fn connect_afc(
+    provider: &UsbmuxdProvider,
+    afc_mode: &AfcMode,
+) -> Result<AfcClient, IdeviceError> {
+    match afc_mode {
+        AfcMode::Root => AfcClient::connect(provider).await,
+        AfcMode::Documents(bundle_id) => {
+            HouseArrestClient::connect(provider)
+                .await?
+                .vend_documents(bundle_id)
+                .await
+        }
+        AfcMode::Container(bundle_id) => {
+            HouseArrestClient::connect(provider)
+                .await?
+                .vend_container(bundle_id)
+                .await
+        }
+        AfcMode::CrashReports => Ok(CrashReportCopyMobileClient::connect(provider)
+            .await?
+            .to_afc_client()),
+    }
+}
+
+async fn download_file(
+    client: &mut AfcClient,
+    remote_path: &str,
+    local_path: &Path,
+    mut on_progress: impl FnMut(usize),
+) -> Result<(), TransferError> {
+    let mut remote_file =
+        tokio::io::BufReader::new(client.open(remote_path, AfcFopenMode::RdOnly).await?);
+
+    let mut local_file = tokio::io::BufWriter::new(
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(local_path)
+            .await?,
+    );
+
+    // 64KB buffer
+    let mut buf = [0u8; 64 * 1024];
+    let mut transferred: usize = 0;
+
+    loop {
+        let n = remote_file.read(&mut buf).await?;
+
+        if n == 0 {
+            break;
+        }
+
+        local_file.write_all(&buf[..n]).await?;
+        transferred += n;
+        on_progress(transferred);
+    }
+
+    local_file.flush().await?;
+    remote_file.into_inner().close().await?;
+
+    Ok(())
+}
+
+async fn upload_file(
+    client: &mut AfcClient,
+    local_path: &Path,
+    remote_path: &str,
+    mut on_progress: impl FnMut(usize),
+) -> Result<(), TransferError> {
+    let mut local_file = tokio::io::BufReader::new(
+        tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(local_path)
+            .await?,
+    );
+    let mut remote_file =
+        tokio::io::BufWriter::new(client.open(remote_path, AfcFopenMode::Wr).await?);
+
+    // 64KB buffer
+    let mut buf = [0u8; 64 * 1024];
+    let mut transferred: usize = 0;
+
+    loop {
+        let n = local_file.read(&mut buf).await?;
+
+        if n == 0 {
+            break;
+        }
+
+        remote_file.write_all(&buf[..n]).await?;
+        transferred += n;
+        on_progress(transferred);
+    }
+
+    remote_file.flush().await?;
+    remote_file.into_inner().close().await?;
+
+    Ok(())
+}
+
+enum TransferJob {
+    /// Remote path (file or directory) to local path
+    Download(String, PathBuf),
+    UploadDir(PathBuf, String),
+    UploadFile(PathBuf, String),
+}
+
+/// Work queue shared by the transfer workers. Directory jobs push their
+/// children back onto the queue, so the tree is walked in parallel too.
+struct TransferQueue {
+    jobs: std::sync::Mutex<VecDeque<TransferJob>>,
+    /// Jobs queued or in progress
+    pending: AtomicUsize,
+    /// Jobs ever queued
+    total: AtomicUsize,
+    failed: AtomicUsize,
+    notify: Notify,
+}
+
+impl TransferQueue {
+    fn new() -> Self {
+        Self {
+            jobs: std::sync::Mutex::new(VecDeque::new()),
+            pending: AtomicUsize::new(0),
+            total: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
+            notify: Notify::new(),
+        }
+    }
+
+    fn push(&self, job: TransferJob) {
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        self.total.fetch_add(1, Ordering::SeqCst);
+        self.jobs.lock().unwrap().push_back(job);
+        self.notify.notify_waiters();
+    }
+
+    /// Returns None once the queue is empty and no job can add more work
+    async fn next(&self) -> Option<TransferJob> {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let job = self.jobs.lock().unwrap().pop_front();
+            if job.is_some() {
+                return job;
+            }
+            if self.pending.load(Ordering::SeqCst) == 0 {
+                return None;
+            }
+            notified.await;
+        }
+    }
+
+    fn finish(&self) {
+        if self.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// (done, total)
+    fn progress(&self) -> (usize, usize) {
+        let total = self.total.load(Ordering::SeqCst);
+        (total - self.pending.load(Ordering::SeqCst), total)
+    }
+}
+
+async fn run_transfer_job(
+    client: &mut AfcClient,
+    job: &TransferJob,
+    queue: &TransferQueue,
+) -> Result<(), TransferError> {
+    match job {
+        TransferJob::Download(remote_path, local_path) => {
+            let info = client.get_file_info(remote_path).await?;
+            if info.st_ifmt == "S_IFDIR" {
+                tokio::fs::create_dir_all(local_path).await?;
+                for item_name in client.list_dir(remote_path).await? {
+                    if item_name == "." || item_name == ".." {
+                        continue;
+                    }
+                    queue.push(TransferJob::Download(
+                        format!("{remote_path}/{item_name}"),
+                        local_path.join(&item_name),
+                    ));
+                }
+            } else {
+                download_file(client, remote_path, local_path, |_| {}).await?;
+            }
+        }
+        TransferJob::UploadDir(local_path, remote_path) => {
+            client.mk_dir(remote_path).await?;
+            let mut dir_entries = tokio::fs::read_dir(local_path).await?;
+            while let Some(entry) = dir_entries.next_entry().await? {
+                let entry_path = entry.path();
+                let entry_name = entry.file_name();
+                let Some(entry_name) = entry_name.to_str() else {
+                    log::warn!("Skipping non-UTF-8 path {:?}", entry_path);
+                    continue;
+                };
+                let child_remote_path = format!("{remote_path}/{entry_name}");
+
+                let file_type = entry.file_type().await?;
+                if file_type.is_dir() {
+                    queue.push(TransferJob::UploadDir(entry_path, child_remote_path));
+                } else if file_type.is_file() {
+                    queue.push(TransferJob::UploadFile(entry_path, child_remote_path));
+                } else {
+                    // Skip symlinks, sockets, etc.
+                    log::warn!("Skipping unsupported file type at {:?}", entry_path);
+                }
+            }
+        }
+        TransferJob::UploadFile(local_path, remote_path) => {
+            upload_file(client, local_path, remote_path, |_| {}).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_folder_transfer(
+    provider: Arc<UsbmuxdProvider>,
+    afc_mode: AfcMode,
+    root: TransferJob,
+    label: String,
+    upload: bool,
+    gui_sender: UnboundedSender<GuiCommands>,
+) {
+    let clients: Vec<AfcClient> =
+        join_all((0..TRANSFER_CONNECTIONS).map(|_| connect_afc(&provider, &afc_mode)))
+            .await
+            .into_iter()
+            .filter_map(|c| {
+                c.map_err(|e| log::warn!("Failed to open extra AFC connection: {e:?}"))
+                    .ok()
+            })
+            .collect();
+
+    if clients.is_empty() {
+        let _ = gui_sender.send(GuiCommands::Afc(GuiAfcCommands::OperationStatus(Err(
+            format!("{label}: failed to open AFC connection"),
+        ))));
+        return;
+    }
+
+    let queue = TransferQueue::new();
+    queue.push(root);
+
+    join_all(clients.into_iter().map(|mut client| {
+        let queue = &queue;
+        let label = &label;
+        let gui_sender = &gui_sender;
+        async move {
+            while let Some(job) = queue.next().await {
+                if let Err(e) = run_transfer_job(&mut client, &job, queue).await {
+                    queue.failed.fetch_add(1, Ordering::SeqCst);
+                    match &job {
+                        TransferJob::Download(remote, _) => {
+                            error!("Failed to download {remote}: {e}")
+                        }
+                        TransferJob::UploadDir(local, _) | TransferJob::UploadFile(local, _) => {
+                            error!("Failed to upload {}: {e}", local.display())
+                        }
+                    }
+                }
+                queue.finish();
+
+                let (done, total) = queue.progress();
+                let _ = gui_sender.send(GuiCommands::Afc(GuiAfcCommands::FolderProgress(
+                    label.clone(),
+                    upload,
+                    done,
+                    total,
+                )));
+            }
+        }
+    }))
+    .await;
+
+    let (done, _) = queue.progress();
+    let failed = queue.failed.load(Ordering::SeqCst);
+    let msg = if failed == 0 {
+        Ok(format!("{label}: finished {done} items"))
+    } else {
+        Err(format!(
+            "{label}: {failed} of {done} items failed, see logs"
+        ))
+    };
+    let _ = gui_sender.send(GuiCommands::Afc(GuiAfcCommands::OperationStatus(msg)));
+}
+
 // Commands sent from the GUI to the backend tasks
 enum IdeviceCommands {
     GetDevices,
@@ -629,6 +772,8 @@ enum GuiAfcCommands {
     OperationStatus(Result<String, String>),
     UploadProgress(String, usize, usize),
     DownloadProgress(String, usize, usize),
+    /// Label, is upload, items done, items discovered so far
+    FolderProgress(String, bool, usize, usize),
 }
 
 // Main application state
@@ -763,6 +908,21 @@ impl eframe::App for MyApp {
                             self.afc_state.download_progress = Some((path, progress));
 
                             // Ensure upload progress is cleared if a download starts
+                            self.afc_state.upload_progress = None;
+                        }
+                    }
+                    GuiAfcCommands::FolderProgress(label, upload, done, total) => {
+                        let progress = if total > 0 {
+                            done as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        self.afc_state.status_message = format!("{label}... {done}/{total} items");
+                        if upload {
+                            self.afc_state.upload_progress = Some((label, progress));
+                            self.afc_state.download_progress = None;
+                        } else {
+                            self.afc_state.download_progress = Some((label, progress));
                             self.afc_state.upload_progress = None;
                         }
                     }
